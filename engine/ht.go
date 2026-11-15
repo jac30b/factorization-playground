@@ -37,16 +37,16 @@ func (key IntKey) Equal(other Key) bool {
 
 // BucketMetadata occupies exactly 64 bits:
 //
-//	[ 16-bit Bloom filter salt | 48-bit pointer to the first row ]
+//	[ 16-bit Bloom filter salt | 48-bit pointer to the distinct-key group ]
 //
-// The pointer is a one-based index into HashTable.nodes, rather than a raw Go
+// The pointer is a one-based index into HashTable.groups, rather than a raw Go
 // address. Zero means the bucket is empty. This retains a compact 48-bit
 // physical layout without using unsafe pointers.
 type BucketMetadata uint64
 
 func newBucketMetadata(salt uint16, head uint64) BucketMetadata {
 	if head > pointerMask {
-		panic("hash-table row arena exceeds 48-bit address space")
+		panic("hash-table group arena exceeds 48-bit address space")
 	}
 	return BucketMetadata(uint64(salt)<<saltShift | head)
 }
@@ -65,20 +65,28 @@ func (metadata BucketMetadata) Head() uint64 {
 	return uint64(metadata) & pointerMask
 }
 
-type hashEntry struct {
-	hash uint64
-	key  Key
+// keyGroup stores key metadata once, shared by every row with that key.
+type keyGroup struct {
+	hash  uint64
+	key   Key
+	head  uint64 // one-based index into HashTable.nodes; zero ends the row chain
+	count int
+}
+
+// rowReference retains the row map without copying its payload.
+type rowReference struct {
 	row  Row
-	next uint64 // one-based index into HashTable.nodes; zero ends the duplicate chain
+	next uint64 // one-based index into HashTable.nodes; zero ends the row chain
 }
 
 // HashTable is a linear-chained hash table. Linear probing resolves collisions
-// between different keys. Each occupied bucket contains exactly one distinct
-// key, and its 48-bit head points to a linked list of rows with that key.
+// between different keys. Each occupied bucket points to one distinct-key group,
+// which owns a linked list of references to rows with that key.
+// The zero value is ready to use.
 type HashTable struct {
 	buckets []BucketMetadata
-	nodes   []hashEntry
-	used    int // occupied buckets, not row count
+	groups  []keyGroup
+	nodes   []rowReference
 }
 
 func NewHashTable(capacity int) *HashTable {
@@ -102,16 +110,23 @@ retry:
 				table.grow()
 				goto retry
 			}
-			table.buckets[index] = newBucketMetadata(salt, table.appendNode(hash, key, row, 0))
-			table.used++
+			groupID := uint64(len(table.groups)) + 1
+			if groupID > pointerMask {
+				panic("hash-table group arena exceeds 48-bit address space")
+			}
+			table.groups = append(table.groups, keyGroup{
+				hash: hash, key: key, head: table.appendNode(row, 0), count: 1,
+			})
+			table.buckets[index] = newBucketMetadata(salt, groupID)
 			return
 		}
 		if !metadata.mayContainSalt(salt) {
 			continue
 		}
-		first := table.node(head)
-		if first.hash == hash && first.key.Equal(key) {
-			table.buckets[index] = newBucketMetadata(salt, table.appendNode(hash, key, row, head))
+		group := table.group(head)
+		if group.hash == hash && group.key.Equal(key) {
+			group.head = table.appendNode(row, group.head)
+			group.count++
 			return
 		}
 	}
@@ -120,6 +135,9 @@ retry:
 }
 
 func (table *HashTable) Lookup(key Key) []Row {
+	if len(table.buckets) == 0 {
+		return nil
+	}
 	hash := hashKey(key)
 	salt := saltFromHash(hash)
 	for probes := 0; probes < len(table.buckets); probes++ {
@@ -131,54 +149,64 @@ func (table *HashTable) Lookup(key Key) []Row {
 		if !metadata.mayContainSalt(salt) {
 			continue
 		}
-		first := table.node(head)
-		if first.hash != hash || !first.key.Equal(key) {
+		group := table.group(head)
+		if group.hash != hash || !group.key.Equal(key) {
 			continue
 		}
 
-		matches := make([]Row, 0)
-		for current := head; current != 0; current = table.node(current).next {
-			matches = append(matches, table.node(current).row)
+		matches := make([]Row, 0, group.count)
+		for i := group.head; i != 0; i = table.node(i).next {
+			matches = append(matches, table.node(i).row)
 		}
 		return matches
 	}
 	return nil
 }
 
-func (table *HashTable) appendNode(hash uint64, key Key, row Row, next uint64) uint64 {
+func (table *HashTable) appendNode(row Row, next uint64) uint64 {
 	address := uint64(len(table.nodes)) + 1
 	if address > pointerMask {
 		panic("hash-table row arena exceeds 48-bit address space")
 	}
-	table.nodes = append(table.nodes, hashEntry{hash: hash, key: key, row: row, next: next})
+	table.nodes = append(table.nodes, rowReference{row: row, next: next})
 	return address
 }
 
-func (table *HashTable) node(address uint64) *hashEntry {
+func (table *HashTable) node(address uint64) *rowReference {
 	return &table.nodes[address-1]
 }
 
+func (table *HashTable) group(address uint64) *keyGroup {
+	return &table.groups[address-1]
+}
+
 func (table *HashTable) bucketIndex(hash uint64, probes int) int {
+	// Callers only probe nonempty bucket slices. Modulo guarantees an index in
+	// [0, len(table.buckets)), including when the unsigned addition wraps.
 	return int((hash + uint64(probes)) % uint64(len(table.buckets)))
 }
 
 func (table *HashTable) wouldExceedLoadFactor() bool {
-	return (table.used+1)*10 > len(table.buckets)*7
+	return (len(table.groups)+1)*10 > len(table.buckets)*7
 }
 
 func (table *HashTable) grow() {
 	oldBuckets := table.buckets
-	table.buckets = make([]BucketMetadata, len(oldBuckets)*2)
+	capacity := len(oldBuckets) * 2
+	if capacity == 0 {
+		capacity = 1
+	}
+	table.buckets = make([]BucketMetadata, capacity)
 	for _, metadata := range oldBuckets {
 		head := metadata.Head()
 		if head == 0 {
 			continue
 		}
-		first := table.node(head)
+		group := table.group(head)
 		for probes := 0; ; probes++ {
-			index := table.bucketIndex(first.hash, probes)
+			index := table.bucketIndex(group.hash, probes)
 			if table.buckets[index].Head() == 0 {
-				table.buckets[index] = newBucketMetadata(saltFromHash(first.hash), head)
+				table.buckets[index] = newBucketMetadata(saltFromHash(group.hash), head)
 				break
 			}
 		}

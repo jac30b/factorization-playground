@@ -1,6 +1,91 @@
 package engine
 
-import "testing"
+import (
+	"hash"
+	"testing"
+)
+
+// collidingKey forces full hash collisions while retaining distinct keys.
+type collidingKey int64
+
+func (key collidingKey) WriteHash(writer hash.Hash) {
+	_, _ = writer.Write([]byte{0})
+}
+
+func (key collidingKey) Equal(other Key) bool {
+	otherKey, ok := other.(collidingKey)
+	return ok && key == otherKey
+}
+
+func TestHashTableZeroValue(t *testing.T) {
+	var table HashTable
+	if rows := table.Lookup(collidingKey(1)); rows != nil {
+		t.Fatalf("empty lookup returned %v", rows)
+	}
+	// Exercise initialization, probing, growth, and duplicate chains together.
+	for key := collidingKey(0); key < 32; key++ {
+		table.Insert(key, Row{"value": int64(key)})
+		table.Insert(key, Row{"value": int64(key)})
+	}
+	for key := collidingKey(0); key < 32; key++ {
+		rows := table.Lookup(key)
+		if len(rows) != 2 || rows[0]["value"] != int64(key) || rows[1]["value"] != int64(key) {
+			t.Fatalf("lookup(%d) = %v, want two matching rows", key, rows)
+		}
+	}
+	if rows := table.Lookup(collidingKey(32)); rows != nil {
+		t.Fatalf("missing lookup returned %v", rows)
+	}
+}
+
+func TestHashTableGroupsSurviveCollisionsAndGrowth(t *testing.T) {
+	table := NewHashTable(2)
+	const keys = 64
+	const duplicates = 8
+	for round := 0; round < duplicates; round++ {
+		for key := 0; key < keys; key++ {
+			table.Insert(collidingKey(key), Row{"key": int64(key), "round": int64(round)})
+		}
+	}
+	if len(table.groups) != keys {
+		t.Fatalf("groups = %d, want %d", len(table.groups), keys)
+	}
+	if len(table.nodes) != keys*duplicates {
+		t.Fatalf("row references = %d, want %d", len(table.nodes), keys*duplicates)
+	}
+	for key := 0; key < keys; key++ {
+		rows := table.Lookup(collidingKey(key))
+		if len(rows) != duplicates {
+			t.Fatalf("lookup(%d) returned %d rows, want %d", key, len(rows), duplicates)
+		}
+		for index, row := range rows {
+			if row["key"] != int64(key) || row["round"] != int64(duplicates-1-index) {
+				t.Fatalf("lookup(%d)[%d] = %v, want key %d, round %d", key, index, row, key, duplicates-1-index)
+			}
+		}
+	}
+	if rows := table.Lookup(collidingKey(keys)); rows != nil {
+		t.Fatalf("missing colliding key returned %v", rows)
+	}
+}
+
+func TestHashTableDuplicatesKeepGroupAndBucket(t *testing.T) {
+	table := NewHashTable(2)
+	key := IntKey(7)
+	table.Insert(key, Row{"value": 0})
+	index := table.bucketIndex(hashKey(key), 0)
+	metadata := table.buckets[index]
+	bucketCount := len(table.buckets)
+	for value := int64(1); value < 1024; value++ {
+		table.Insert(key, Row{"value": value})
+	}
+	if len(table.groups) != 1 || len(table.buckets) != bucketCount || table.buckets[index] != metadata {
+		t.Fatal("duplicate inserts changed the distinct-key group or bucket directory")
+	}
+	if rows := table.Lookup(key); len(rows) != 1024 {
+		t.Fatalf("lookup returned %d rows, want 1024", len(rows))
+	}
+}
 
 func TestHashTablePreservesDuplicateKeys(t *testing.T) {
 	table := NewHashTable(2)
