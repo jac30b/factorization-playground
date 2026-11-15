@@ -31,8 +31,9 @@ type Join struct {
 	Right  string // qualified column name
 }
 
-// Operator is the seam for experiments. FactorizedJoin can implement this
-// interface and replace HashJoin without changing the parser or planner.
+// Operator exposes flat results at the query boundary. Factorized operators
+// also implement an internal interface used by joins and aggregation to retain
+// grouped row references until the final result is produced.
 type Operator interface {
 	Execute() ([]Row, error)
 	Explain() string

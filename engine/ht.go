@@ -135,8 +135,23 @@ retry:
 }
 
 func (table *HashTable) Lookup(key Key) []Row {
-	if len(table.buckets) == 0 {
+	id := table.lookupGroup(key)
+	if id == 0 {
 		return nil
+	}
+	group := table.group(id)
+	matches := make([]Row, 0, group.count)
+	for i := group.head; i != 0; i = table.node(i).next {
+		matches = append(matches, table.node(i).row)
+	}
+	return matches
+}
+
+// lookupGroup returns a stable one-based group index without allocating or
+// expanding the duplicate chain. Zero means there is no matching group.
+func (table *HashTable) lookupGroup(key Key) uint64 {
+	if len(table.buckets) == 0 {
+		return 0
 	}
 	hash := hashKey(key)
 	salt := saltFromHash(hash)
@@ -144,23 +159,17 @@ func (table *HashTable) Lookup(key Key) []Row {
 		metadata := table.buckets[table.bucketIndex(hash, probes)]
 		head := metadata.Head()
 		if head == 0 {
-			return nil
+			return 0
 		}
 		if !metadata.mayContainSalt(salt) {
 			continue
 		}
 		group := table.group(head)
-		if group.hash != hash || !group.key.Equal(key) {
-			continue
+		if group.hash == hash && group.key.Equal(key) {
+			return head
 		}
-
-		matches := make([]Row, 0, group.count)
-		for i := group.head; i != 0; i = table.node(i).next {
-			matches = append(matches, table.node(i).row)
-		}
-		return matches
 	}
-	return nil
+	return 0
 }
 
 func (table *HashTable) appendNode(row Row, next uint64) uint64 {

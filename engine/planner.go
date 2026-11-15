@@ -5,7 +5,7 @@ import (
 	"strings"
 )
 
-// Plan turns a parsed query into the baseline physical plan.
+// Plan turns a parsed query into the factorized physical plan.
 func Plan(catalog Catalog, query Query) (Operator, error) {
 	root, err := makeScan(catalog, query.From)
 	if err != nil {
@@ -24,7 +24,7 @@ func Plan(catalog Catalog, query Query) (Operator, error) {
 		if err != nil {
 			return nil, err
 		}
-		root = HashJoin{Left: root, Right: right, LeftKey: leftKey, RightKey: rightKey}
+		root = FactorizedJoin{Left: root, Right: right, LeftKey: leftKey, RightKey: rightKey}
 		knownAliases[join.Source.Alias] = true
 	}
 	return aggregate{input: root, groupBy: query.GroupBy}, nil

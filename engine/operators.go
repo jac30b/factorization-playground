@@ -78,50 +78,14 @@ func (j HashJoin) Explain() string {
 	return "HashJoin(" + j.LeftKey + " = " + j.RightKey + ")\n  " + strings.ReplaceAll(j.Left.Explain(), "\n", "\n  ") + "\n  " + strings.ReplaceAll(j.Right.Explain(), "\n", "\n  ")
 }
 
-// aggregate is the baseline flat GROUP BY implementation. It receives already
-// materialized join rows; a factorized aggregation can replace it later.
+// aggregate consumes row factors and multiplies their multiplicities for COUNT.
 type aggregate struct {
 	input   Operator
 	groupBy []string
 }
 
 func (a aggregate) Execute() ([]Row, error) {
-	rows, err := a.input.Execute()
-	if err != nil {
-		return nil, err
-	}
-	type group struct {
-		values []int64
-		count  int64
-	}
-	groups := make(map[string]*group)
-	for _, row := range rows {
-		values := make([]int64, len(a.groupBy))
-		for index, column := range a.groupBy {
-			value, ok := row[column]
-			if !ok {
-				return nil, fmt.Errorf("GROUP BY column %q does not exist", column)
-			}
-			values[index] = value
-		}
-		key := groupKey(values)
-		if groups[key] == nil {
-			groups[key] = &group{values: values}
-		}
-		groups[key].count++
-	}
-	if len(a.groupBy) == 0 && len(groups) == 0 {
-		groups[""] = &group{}
-	}
-	result := make([]Row, 0, len(groups))
-	for _, group := range groups {
-		row := Row{"count": group.count}
-		for index, column := range a.groupBy {
-			row[column] = group.values[index]
-		}
-		result = append(result, row)
-	}
-	return result, nil
+	return aggregateFactors(a.input, a.groupBy)
 }
 
 func (a aggregate) Explain() string {
